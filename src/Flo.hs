@@ -1,11 +1,10 @@
 module Flo (
-    parseFlo,
-    parse
+    parse,
+    progP
 ) where
 
 import Control.Applicative
 import Data.Char
-import Debug.Trace
 
 {-
 Flo grammar (to be expanded on)
@@ -24,10 +23,12 @@ expr' := Ident | IntLit | (expr)
 type Ident = String
 type TypeName = String
 
-data Expr = EPlus Expr' Expr | ESub Expr' 
+data Expr = EPlus Var Expr
+    | EVar Var
     deriving Show
 
-data Expr' = EIdent Ident | EIntLit Int | EGroup Expr
+data Var = VIntLit Int
+    | VIdent Ident
     deriving Show
 
 data FuncInfo = FuncSig Ident [TypeName]
@@ -64,136 +65,107 @@ instance Monad (Parser a) where
         return $ concat optionsF
 
 instance Alternative (Parser a) where
-    empty = Parser $ \_ -> Left UnexpectedEOF
+    empty = errEofP
     Parser run1 <|> Parser run2 = Parser $ \s -> run1 s <> run2 s
 
 parse :: Parser a b -> [a] -> Either (ParseError a) [(b, [a])]
 parse p s = runParser p s
 
-isTerminator :: Char -> Bool
-isTerminator c = c `elem` ":;-=+()" || isSpace c
+errEofP :: Parser a b
+errEofP = Parser $ \_ -> Left UnexpectedEOF
+
+satP :: (a -> Bool) -> Parser a a
+satP p = Parser $ \s -> case s of
+    [] -> Left UnexpectedEOF
+    x:xs
+        | p x       -> Right [(x, xs)]
+        | otherwise -> Left $ Unexpected x
 
 charP :: Char -> Parser Char Char
-charP c = Parser $ \s -> if null s then
-        Left $ UnexpectedEOF
-    else if head s == c then
-        Right $ [(c, tail s)]
-    else
-        Left $ Unexpected (head s)
+charP c = satP (==c)
+
+digitP :: Parser Char Char
+digitP = satP isDigit
 
 stringP :: String -> Parser Char String
-stringP = fmap reverse . traverse charP . reverse
+stringP []     = return []
+stringP (x:xs) = charP x >> stringP xs
+
+manyC :: Parser a b -> Parser a [b]
+manyC parser = do {
+        next <- parser; 
+        rest <- manyC parser;
+        return (next:rest);
+    } <|> return []
+
+many1C :: Parser a b -> Parser a [b]
+many1C parser = do
+    next <- parser
+    rest <- manyC parser
+    return (next:rest)
+
+noSpaceC :: Parser Char b -> Parser Char b
+noSpaceC (Parser run) = Parser $ run . dropWhile isSpace
+
+sepByC :: Parser a c -> Parser a b -> Parser a [b]
+sepByC sep parser = do
+    first <- parser
+    rest <- manyC (sep >> parser)
+    return (first:rest)
+
+specials :: [Char]
+specials = ";:+=-"
 
 tokenP :: Parser Char String
-tokenP = Parser $ \s -> if null s then
-        Left UnexpectedEOF
-    else
-        Right [break isTerminator s]
+tokenP = many1C $ satP (\c -> not $ isTerminator c)
+    where
+        isTerminator c = c `elem` specials || isSpace c
 
-ignoreSpace :: Parser Char b -> Parser Char b       
-ignoreSpace (Parser run) = Parser $ \s -> run (dropWhile isSpace s)
+identP :: Parser Char String
+identP = noSpaceC tokenP
 
-try :: Parser a b -> Parser a (Maybe b)
-try (Parser run) = Parser $ \s -> case run s of
-    Left _ -> Right [(Nothing, s)]
-    Right options -> Right $ map (\(x, _) -> (Just x, s)) options
+typeP :: Parser Char String
+typeP = noSpaceC tokenP
 
-tryConsume :: Parser a b -> Parser a (Maybe b)
-tryConsume (Parser run) = Parser $ \s -> case run s of
-    Left _  -> Right [(Nothing, s)] 
-    Right options -> Right $ map (\(x, y) -> (Just x, y)) options
+intLitP :: Parser Char String
+intLitP = noSpaceC $ many1C digitP
 
-eof :: Parser a () 
-eof = Parser $ \s -> if null s then Right [((), s)] else Left (Unexpected $ head s)
+vIntLitP :: Parser Char Var
+vIntLitP = intLitP >>= return . VIntLit . read
 
-parseEIdent :: Parser Char Expr'
-parseEIdent = do
-    ident <- tokenP
-    return $ EIdent ident
+vIdentP :: Parser Char Var
+vIdentP = identP >>= return . VIdent
 
-parseEIntLit :: Parser Char Expr'
-parseEIntLit = Parser $ \s -> let
-    (pref, suff) = break isTerminator s
-    (n, garbage) = span isDigit pref in
-        if null s then
-            Left $ UnexpectedEOF
-        else if null garbage then
-            Right [(EIntLit $ read n, suff)]
-        else
-            Left $ Unexpected (head garbage)
+varP :: Parser Char Var
+varP = vIntLitP <|> vIdentP
 
-parseEGroup :: Parser Char Expr'
-parseEGroup = do
-    _ <- charP '('
-    expr <- ignoreSpace $ parseExpr
-    _ <- ignoreSpace $ charP ')'
-    return $ EGroup expr
+eVarP :: Parser Char Expr
+eVarP = varP >>= return . EVar 
 
-parseExpr' :: Parser Char Expr' 
-parseExpr' = ignoreSpace $ parseEGroup <|> parseEIntLit <|> parseEIdent
+ePlusP :: Parser Char Expr
+ePlusP = do
+    var <- varP
+    _ <- noSpaceC $ charP '+'
+    expr <- exprP
+    return $ EPlus var expr
 
-parseESub :: Parser Char Expr
-parseESub = do
-    subexpr <- parseExpr'
-    return $ ESub subexpr
+exprP :: Parser Char Expr
+exprP = ePlusP <|> eVarP
 
-parseEPlus :: Parser Char Expr
-parseEPlus = do
-    first <- parseExpr'
-    _ <- ignoreSpace $ charP '+'
-    second <- ignoreSpace $ parseExpr
-    return $ EPlus first second
+funcSigP :: Parser Char FuncInfo
+funcSigP = do
+    name <- identP
+    _ <- noSpaceC $ charP ':'
+    types <- sepByC (noSpaceC $ stringP "->") typeP
+    return $ FuncSig name types
 
-parseExpr :: Parser Char Expr
-parseExpr = ignoreSpace $ parseEPlus <|> parseESub
-
-parseTypeList :: Parser Char [TypeName]
-parseTypeList = do
-    check <- tryConsume $ charP ';'
-    if check == Nothing then do
-        _ <- tryConsume $ stringP "->"
-        typename <- ignoreSpace $ tokenP
-        typenames <- ignoreSpace $ parseTypeList
-        return (typename:typenames)
-    else do
-        return []
-
-parseFuncSig :: Parser Char FuncInfo
-parseFuncSig = do 
-    name <- tokenP
-    _ <- ignoreSpace $ charP ':'
-    typenames <- ignoreSpace parseTypeList
-    return $ FuncSig name typenames
-
-parseArgList :: Parser Char [Ident]
-parseArgList = do
-    check <- try $ charP '='
-    if check == Nothing then do
-        arg <- tokenP
-        args <- ignoreSpace parseArgList
-        return (arg:args)
-    else do
-        return []
-
-parseFuncDef :: Parser Char FuncInfo
-parseFuncDef = do
-    name <- tokenP
-    args <- ignoreSpace parseArgList
-    _ <- ignoreSpace $ charP '='
-    expr <- ignoreSpace parseExpr
-    _ <- ignoreSpace $ charP ';'
+funcDefP :: Parser Char FuncInfo
+funcDefP = do
+    name <- identP
+    args <- manyC identP
+    _ <- noSpaceC $ charP '='
+    expr <- exprP
     return $ FuncDef name args expr
 
-parseFlo :: Parser Char AST
-parseFlo = do
-    attempt <- try eof
-    if attempt == Nothing then do
-        next <- ignoreSpace $ parseFuncSig <|> parseFuncDef
-        Prog rest <- ignoreSpace $ parseFlo
-        return $ Prog (next:rest)
-    else do
-        return $ Prog []
-
---TODO: Typechecking
---TODO: Semantics
---TODO: Emitting
+progP :: Parser Char AST
+progP = many1C (funcDefP <|> funcSigP) >>= return . Prog

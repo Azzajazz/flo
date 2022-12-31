@@ -5,5 +5,5 @@ import Flo
 main :: IO ()
 main = do
     code <- readFile "simple.fl"
-    let result = parse parseFlo code 
+    let result = parse progP code 
     print result
