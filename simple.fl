@@ -1,2 +1,2 @@
-test : Int -> Int
+test : Bool -> Int
 test x = x + 1

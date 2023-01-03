@@ -1,6 +1,7 @@
 module Flo (
     parse,
-    progP
+    progP,
+    typeCheckProg
 ) where
 
 import Control.Applicative
@@ -16,21 +17,21 @@ type := (Int | Bool) (-> type)*
 -}
 
 type Ident = String
-data Type = TBool
-    | TInt
-    | TFunc Type Type
-    deriving Show
 
-data Expr = EPlus (Maybe Type) Var Expr
-    | EVar (Maybe Type) Var
+data Expr = EPlus Var Expr
+    | EVar Var
     deriving Show
 
 data Var = VIntLit Int
-    | VIdent (Maybe Type) Ident
+    | VIdent Ident
     deriving Show
 
-data FuncInfo = FuncSig Ident Type
-    | FuncDef Ident [Ident] Expr
+data FuncSig = FuncSig Ident Type deriving Show
+
+data FuncDef = FuncDef Ident [Ident] Expr deriving Show
+
+data FuncInfo = ISig FuncSig
+    | IDef FuncDef
     deriving Show
 
 data AST = Prog [FuncInfo] deriving Show
@@ -145,32 +146,32 @@ vIntLitP :: Parser Char Var
 vIntLitP = intLitP >>= return . VIntLit . read
 
 vIdentP :: Parser Char Var
-vIdentP = identP >>= return . VIdent Nothing
+vIdentP = identP >>= return . VIdent
 
 varP :: Parser Char Var
 varP = vIntLitP <|> vIdentP
 
 eVarP :: Parser Char Expr
-eVarP = varP >>= return . EVar Nothing 
+eVarP = varP >>= return . EVar
 
 ePlusP :: Parser Char Expr
 ePlusP = do
     var <- varP
     _ <- noSpaceC $ charP '+'
     expr <- exprP
-    return $ EPlus Nothing var expr
+    return $ EPlus var expr
 
 exprP :: Parser Char Expr
 exprP = ePlusP <|> eVarP
 
-funcSigP :: Parser Char FuncInfo
+funcSigP :: Parser Char FuncSig
 funcSigP = do
     name <- identP
     _ <- noSpaceC $ charP ':'
     functype <- funcTypeP
     return $ FuncSig name functype 
 
-funcDefP :: Parser Char FuncInfo
+funcDefP :: Parser Char FuncDef
 funcDefP = do
     name <- identP
     args <- manyC identP
@@ -178,17 +179,25 @@ funcDefP = do
     expr <- exprP
     return $ FuncDef name args expr
 
+funcInfoP :: Parser Char FuncInfo
+funcInfoP = (funcDefP >>= return . IDef) <|> (funcSigP >>= return . ISig)
+
 progP :: Parser Char AST
-progP = many1C (funcDefP <|> funcSigP) >>= return . Prog
+progP = many1C funcInfoP >>= return . Prog
 
 -- TODO (BIG): Type checking
+data Type = TBool
+    | TInt
+    | TFunc Type Type
+    deriving (Show, Eq)
+
 newtype TypeEnv = TypeEnv {getType :: Ident -> Maybe Type}
 
 teEmpty :: TypeEnv
 teEmpty = TypeEnv $ \_ -> Nothing
 
-addType :: (Ident, Type) -> TypeEnv -> TypeEnv
-addType (ident, typename) (TypeEnv lookupType) = TypeEnv newLookupType
+addType :: Ident -> Type -> TypeEnv -> TypeEnv
+addType ident typename (TypeEnv lookupType) = TypeEnv newLookupType
     where
         newLookupType idt
             | idt == ident = Just typename
@@ -201,13 +210,62 @@ removeType ident (TypeEnv lookupType) = TypeEnv newLookupType
             | idt == ident = Nothing
             | otherwise    = lookupType idt
 
-data TypeCheckError = TypeMismatch Type Type
+data TypeError = UsedBeforeDeclared Ident
+    | TypeMismatch Type Type
+    | TooManyArguments Ident
+    | NoTypeSig Ident
+    deriving Show
 
-instance Show TypeCheckError where
-    show (TypeMismatch found expected) = "Types do not match. Expected " ++ show expected ++ ", found " ++ show found
+type TypeChecker a = TypeEnv -> a -> Either TypeError (Type, TypeEnv)
 
-type TypeChecker a = TypeEnv -> a -> Either TypeCheckError (TypeEnv, Type)
+typeCheckVar :: TypeChecker Var
+typeCheckVar env (VIntLit _) = Right (TInt, env)
+typeCheckVar env (VIdent ident) = case getType env ident of
+    Nothing -> Left $ UsedBeforeDeclared ident
+    Just t -> Right (t, env)
 
-typeCheckProgram :: TypeChecker AST
-typeCheckProgram (Prog infos) = undefined 
+typeCheckExpr :: TypeChecker Expr
+typeCheckExpr env (EVar var) = typeCheckVar env var
+typeCheckExpr env (EPlus var expr) = case (typeCheckVar env var, typeCheckExpr env expr) of
+    (Left e, _)                        -> Left e
+    (_, Left e)                        -> Left e
+    (Right (TInt, _), Right (TInt, _)) -> Right (TInt, env)
+    (Right (TInt, _), Right (t, _))    -> Left $ TypeMismatch TInt t 
+    (Right (t, _), _)                  -> Left $ TypeMismatch TInt t
 
+sortTypes :: TypeEnv -> Ident -> [Ident] -> Either TypeError (Type, TypeEnv)
+sortTypes env name args = case getType env name of
+    Nothing -> Left $ NoTypeSig name
+    Just typename -> sortTypes' env name typename args
+    where
+        sortTypes' e n t [] = Right (t, e)
+        sortTypes' e n t (a:as) = case t of
+            TInt -> Left $ TooManyArguments n
+            TBool -> Left $ TooManyArguments n
+            TFunc t1 t2 -> sortTypes' (addType a t1 e) n t2 as
+
+typeCheckFuncDef :: TypeChecker FuncDef
+typeCheckFuncDef env (FuncDef name args expr) = case sortTypes env name args of
+    Left e -> Left e
+    Right (expectedExprT, newEnv) -> case typeCheckExpr newEnv expr of
+        Left e' -> Left e'
+        Right (t, _) -> if expectedExprT == t then
+            Right (t, env)
+        else
+            Left $ TypeMismatch expectedExprT t
+
+typeCheckProg :: AST -> Either TypeError ()
+typeCheckProg (Prog infos) = typeCheckProg' newEnv defs
+    where
+        (newEnv, defs) = consumeSigs teEmpty infos
+        typeCheckProg' e [] = Right ()
+        typeCheckProg' e (d:rest) = case typeCheckFuncDef e d of
+            Left err -> Left err
+            Right _ -> typeCheckProg' e rest
+
+consumeSigs :: TypeEnv -> [FuncInfo] -> (TypeEnv, [FuncDef])
+consumeSigs env infos = consumeSigs' env infos []
+    where
+        consumeSigs' e [] defs = (e, defs)
+        consumeSigs' e (ISig (FuncSig name typename):is) defs = consumeSigs' (addType name typename e) is defs
+        consumeSigs' e (IDef d:is) defs = consumeSigs' e is (d:defs)
