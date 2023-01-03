@@ -7,31 +7,29 @@ import Control.Applicative
 import Data.Char
 
 {-
-Flo grammar (to be expanded on)
-Atoms: Ident, TypeName, IntLit
-
-program := (funcsig | funcdef)*
-funcsig := Ident : typelist;
-typelist := TypeName -> typelist | TypeName
-funcdef := Ident arglist = expr
-arglist := Ident arglist | (empty)
-
-expr := expr + expr'
-expr' := Ident | IntLit | (expr)
+-------- GRAMMAR --------
+program := (funcSignature | funcDefinition)+
+funcSignature := ident : type
+funcDefinition := ident (ident)* = expr
+expr := (literal | ident) + expr | literal | ident
+type := (Int | Bool) (-> type)*
 -}
 
 type Ident = String
-type TypeName = String
+data Type = TBool
+    | TInt
+    | TFunc Type Type
+    deriving Show
 
-data Expr = EPlus Var Expr
-    | EVar Var
+data Expr = EPlus (Maybe Type) Var Expr
+    | EVar (Maybe Type) Var
     deriving Show
 
 data Var = VIntLit Int
-    | VIdent Ident
+    | VIdent (Maybe Type) Ident
     deriving Show
 
-data FuncInfo = FuncSig Ident [TypeName]
+data FuncInfo = FuncSig Ident Type
     | FuncDef Ident [Ident] Expr
     deriving Show
 
@@ -124,8 +122,21 @@ tokenP = many1C $ satP (\c -> not $ isTerminator c)
 identP :: Parser Char String
 identP = noSpaceC tokenP
 
-typeP :: Parser Char String
-typeP = noSpaceC tokenP
+tIntP :: Parser Char Type
+tIntP = noSpaceC (stringP "Int") >> return TInt
+
+tBoolP :: Parser Char Type
+tBoolP = noSpaceC (stringP "Bool") >> return TBool
+
+litTypeP :: Parser Char Type 
+litTypeP = tIntP <|> tBoolP
+
+funcTypeP :: Parser Char Type
+funcTypeP = do
+    first <- litTypeP
+    rest <- noSpaceC (stringP "->") >> (noSpaceC funcTypeP <|> litTypeP)
+    return $ TFunc first rest
+
 
 intLitP :: Parser Char String
 intLitP = noSpaceC $ many1C digitP
@@ -134,20 +145,20 @@ vIntLitP :: Parser Char Var
 vIntLitP = intLitP >>= return . VIntLit . read
 
 vIdentP :: Parser Char Var
-vIdentP = identP >>= return . VIdent
+vIdentP = identP >>= return . VIdent Nothing
 
 varP :: Parser Char Var
 varP = vIntLitP <|> vIdentP
 
 eVarP :: Parser Char Expr
-eVarP = varP >>= return . EVar 
+eVarP = varP >>= return . EVar Nothing 
 
 ePlusP :: Parser Char Expr
 ePlusP = do
     var <- varP
     _ <- noSpaceC $ charP '+'
     expr <- exprP
-    return $ EPlus var expr
+    return $ EPlus Nothing var expr
 
 exprP :: Parser Char Expr
 exprP = ePlusP <|> eVarP
@@ -156,8 +167,8 @@ funcSigP :: Parser Char FuncInfo
 funcSigP = do
     name <- identP
     _ <- noSpaceC $ charP ':'
-    types <- sepByC (noSpaceC $ stringP "->") typeP
-    return $ FuncSig name types
+    functype <- funcTypeP
+    return $ FuncSig name functype 
 
 funcDefP :: Parser Char FuncInfo
 funcDefP = do
@@ -169,3 +180,34 @@ funcDefP = do
 
 progP :: Parser Char AST
 progP = many1C (funcDefP <|> funcSigP) >>= return . Prog
+
+-- TODO (BIG): Type checking
+newtype TypeEnv = TypeEnv {getType :: Ident -> Maybe Type}
+
+teEmpty :: TypeEnv
+teEmpty = TypeEnv $ \_ -> Nothing
+
+addType :: (Ident, Type) -> TypeEnv -> TypeEnv
+addType (ident, typename) (TypeEnv lookupType) = TypeEnv newLookupType
+    where
+        newLookupType idt
+            | idt == ident = Just typename
+            | otherwise   = lookupType idt
+
+removeType :: Ident -> TypeEnv -> TypeEnv
+removeType ident (TypeEnv lookupType) = TypeEnv newLookupType
+    where
+        newLookupType idt
+            | idt == ident = Nothing
+            | otherwise    = lookupType idt
+
+data TypeCheckError = TypeMismatch Type Type
+
+instance Show TypeCheckError where
+    show (TypeMismatch found expected) = "Types do not match. Expected " ++ show expected ++ ", found " ++ show found
+
+type TypeChecker a = TypeEnv -> a -> Either TypeCheckError (TypeEnv, Type)
+
+typeCheckProgram :: TypeChecker AST
+typeCheckProgram (Prog infos) = undefined 
+
