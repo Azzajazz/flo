@@ -26,6 +26,7 @@ source-repository head
 library
   exposed-modules:
       Flo
+      Utils
   other-modules:
       Paths_flo
   hs-source-dirs:

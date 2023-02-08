@@ -1,2 +1,2 @@
-test : Bool -> Int
-test x = x + 1
+f : Int -> Int
+f x = x
